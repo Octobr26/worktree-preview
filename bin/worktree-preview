@@ -52,7 +52,7 @@ listener_pids() {
 }
 
 listener_pid() {
-    listener_pids "${1:-$PREVIEW_PORT}" | head -n 1
+    listener_pids "$PREVIEW_PORT" | head -n 1
 }
 
 process_cwd() {
