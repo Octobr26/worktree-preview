@@ -511,15 +511,22 @@ test_invalid_port_is_rejected() {
 }
 
 test_installer_refuses_unexpected_overwrite() {
+    local alias_collision_prefix
+    local directory_prefix
     local output
     local prefix
     local status
 
     create_fixture
-    prefix="$CASE_DIR/prefix"
+    prefix="$CASE_DIR/prefix with spaces"
     output=$(PREFIX="$prefix" "$ROOT_DIR/install.sh")
     assert_contains "$output" "Installed $prefix/bin/worktree-preview" || return 1
+    assert_contains "$output" "Installed alias $prefix/bin/wtp -> worktree-preview" || return 1
     [[ -x "$prefix/bin/worktree-preview" ]] || return 1
+    [[ -L "$prefix/bin/wtp" && -x "$prefix/bin/wtp" ]] || return 1
+    [[ "$(readlink "$prefix/bin/wtp")" == "worktree-preview" ]] || return 1
+    output=$("$prefix/bin/wtp" --help)
+    assert_contains "$output" "Short alias after installation: wtp" || return 1
 
     if output=$(PREFIX="$prefix" "$ROOT_DIR/install.sh" 2>&1); then
         status=0
@@ -529,6 +536,34 @@ test_installer_refuses_unexpected_overwrite() {
     [[ "$status" -ne 0 ]] || return 1
     assert_contains "$output" "already exists; rerun with --force" || return 1
     PREFIX="$prefix" "$ROOT_DIR/install.sh" --force >/dev/null
+    [[ -L "$prefix/bin/wtp" ]] || return 1
+
+    alias_collision_prefix="$CASE_DIR/alias collision"
+    mkdir -p "$alias_collision_prefix/bin"
+    printf 'keep me\n' > "$alias_collision_prefix/bin/wtp"
+    if output=$(PREFIX="$alias_collision_prefix" "$ROOT_DIR/install.sh" 2>&1); then
+        status=0
+    else
+        status=$?
+    fi
+    [[ "$status" -ne 0 ]] || return 1
+    assert_contains "$output" "$alias_collision_prefix/bin/wtp already exists" || return 1
+    [[ ! -e "$alias_collision_prefix/bin/worktree-preview" ]] || return 1
+    [[ "$(<"$alias_collision_prefix/bin/wtp")" == "keep me" ]] || return 1
+    PREFIX="$alias_collision_prefix" "$ROOT_DIR/install.sh" --force >/dev/null
+    [[ -L "$alias_collision_prefix/bin/wtp" ]] || return 1
+
+    directory_prefix="$CASE_DIR/directory collision"
+    mkdir -p "$directory_prefix/bin/wtp"
+    if output=$(PREFIX="$directory_prefix" "$ROOT_DIR/install.sh" --force 2>&1); then
+        status=0
+    else
+        status=$?
+    fi
+    [[ "$status" -ne 0 ]] || return 1
+    assert_contains "$output" "$directory_prefix/bin/wtp is a directory" || return 1
+    [[ -d "$directory_prefix/bin/wtp" ]] || return 1
+    [[ ! -e "$directory_prefix/bin/worktree-preview" ]] || return 1
 }
 
 test_tmux_integration_is_idempotent() {
