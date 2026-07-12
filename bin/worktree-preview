@@ -1,0 +1,773 @@
+#!/usr/bin/env bash
+
+set -u
+set -o pipefail
+
+STATUS_OPTION="@worktree_preview_status"
+PANE_OPTION="@worktree_preview_pane"
+PID_OPTION="@worktree_preview_pid"
+CWD_OPTION="@worktree_preview_cwd"
+PGID_OPTION="@worktree_preview_pgid"
+PORT_OPTION="@worktree_preview_port"
+WINDOW_OPTION="@worktree_preview_window"
+SHELL_PID_OPTION="@worktree_preview_shell_pid"
+STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/worktree-preview"
+
+note() {
+    printf '%s\n' "$*"
+}
+
+fail() {
+    printf 'worktree-preview: %s\n' "$*" >&2
+    exit 1
+}
+
+usage() {
+    cat <<'EOF'
+Usage:
+  worktree-preview use <branch>
+  worktree-preview stop
+  worktree-preview status
+  worktree-preview --dry-run <branch>
+
+The command controls a dedicated tmux window in the same session from which it
+is invoked. The default window name is `server`.
+
+Optional per-repository Git config:
+  worktreePreview.appDir
+  worktreePreview.port
+  worktreePreview.packageManager
+  worktreePreview.install
+  worktreePreview.start
+  worktreePreview.envFile (repeatable)
+  worktreePreview.window
+  worktreePreview.shell
+EOF
+}
+
+listener_pids() {
+    local port="${1:-$PREVIEW_PORT}"
+
+    lsof -tiTCP:"$port" -sTCP:LISTEN 2>/dev/null | sort -u
+}
+
+listener_pid() {
+    listener_pids "${1:-$PREVIEW_PORT}" | head -n 1
+}
+
+process_cwd() {
+    local pid="$1"
+    lsof -a -p "$pid" -d cwd -Fn 2>/dev/null | sed -n 's/^n//p' | head -n 1
+}
+
+process_group_id() {
+    local pid="$1"
+
+    ps -o pgid= -p "$pid" 2>/dev/null | tr -d '[:space:]'
+}
+
+pane_shell_pid() {
+    local pane="$1"
+
+    tmux display-message -p -t "$pane" '#{pane_pid}' 2>/dev/null || true
+}
+
+pane_foreground_pgid() {
+    local shell_pid="$1"
+
+    ps -o tpgid= -p "$shell_pid" 2>/dev/null | tr -d '[:space:]'
+}
+
+absolute_common_dir() {
+    local root="$1"
+    local common_dir
+
+    common_dir=$(git -C "$root" rev-parse --git-common-dir 2>/dev/null) || return 1
+    if [[ "$common_dir" = /* ]]; then
+        (cd "$common_dir" 2>/dev/null && pwd -P)
+    else
+        (cd "$root/$common_dir" 2>/dev/null && pwd -P)
+    fi
+}
+
+config_get() {
+    git -C "$REPO_ROOT" config --local --get "$1" 2>/dev/null || true
+}
+
+hash_stdin() {
+    if command -v sha256sum >/dev/null 2>&1; then
+        sha256sum | awk '{ print $1 }'
+    elif command -v shasum >/dev/null 2>&1; then
+        shasum -a 256 | awk '{ print $1 }'
+    elif command -v openssl >/dev/null 2>&1; then
+        openssl dgst -sha256 | awk '{ print $NF }'
+    else
+        fail "no SHA-256 tool found (need sha256sum, shasum, or openssl)"
+    fi
+}
+
+hash_file() {
+    local file="$1"
+
+    if command -v sha256sum >/dev/null 2>&1; then
+        sha256sum "$file" | awk '{ print $1 }'
+    elif command -v shasum >/dev/null 2>&1; then
+        shasum -a 256 "$file" | awk '{ print $1 }'
+    elif command -v openssl >/dev/null 2>&1; then
+        openssl dgst -sha256 "$file" | awk '{ print $NF }'
+    else
+        fail "no SHA-256 tool found (need sha256sum, shasum, or openssl)"
+    fi
+}
+
+validate_single_line_command() {
+    local name="$1"
+    local value="$2"
+
+    [[ "$value" != *$'\n'* && "$value" != *$'\r'* ]] || fail "$name must be a single-line command"
+}
+
+initialize_repository() {
+    REPO_ROOT=$(git rev-parse --show-toplevel 2>/dev/null) || fail "run from a Git worktree"
+    COMMON_DIR=$(absolute_common_dir "$REPO_ROOT") || fail "could not resolve common Git directory"
+
+    APP_DIR=$(config_get worktreePreview.appDir)
+    APP_DIR=${APP_DIR:-.}
+    [[ "$APP_DIR" != /* && "$APP_DIR" != *".."* ]] || fail "unsafe appDir: $APP_DIR"
+
+    PREVIEW_PORT=$(config_get worktreePreview.port)
+    PREVIEW_PORT=${PREVIEW_PORT:-3000}
+    [[ "$PREVIEW_PORT" =~ ^[0-9]+$ ]] || fail "invalid preview port: $PREVIEW_PORT"
+    (( PREVIEW_PORT >= 1 && PREVIEW_PORT <= 65535 )) || fail "preview port out of range: $PREVIEW_PORT"
+
+    SERVER_WINDOW=$(config_get worktreePreview.window)
+    SERVER_WINDOW=${SERVER_WINDOW:-server}
+    [[ -n "$SERVER_WINDOW" && "$SERVER_WINDOW" != *:* ]] || fail "invalid tmux window: $SERVER_WINDOW"
+
+    SHELL_PATH=$(config_get worktreePreview.shell)
+    [[ -n "$SHELL_PATH" ]] || SHELL_PATH=$(command -v bash 2>/dev/null || true)
+    [[ -n "$SHELL_PATH" && -x "$SHELL_PATH" ]] || fail "preview shell is not executable: ${SHELL_PATH:-none}"
+}
+
+initialize_tmux_session() {
+    [[ -n "${TMUX_PANE:-}" ]] || fail "run inside tmux"
+    TMUX_SESSION=$(tmux display-message -p -t "$TMUX_PANE" '#{session_name}' 2>/dev/null) ||
+        fail "could not determine current tmux session"
+}
+
+resolve_server_pane() {
+    local server_panes=""
+
+    server_panes=$(tmux list-panes -t "$TMUX_SESSION:$SERVER_WINDOW" -F '#{pane_id}' 2>/dev/null || true)
+    SERVER_PANE=$(printf '%s\n' "$server_panes" | sed -n '1p')
+    [[ -n "$SERVER_PANE" ]] || fail "tmux session '$TMUX_SESSION' has no window named '$SERVER_WINDOW'"
+}
+
+resolve_worktrees() {
+    local wanted_branch="$1"
+    local entry
+    local candidate_path=""
+    local candidate_branch=""
+
+    MAIN_WORKTREE=""
+    TARGET_WORKTREE=""
+
+    while IFS= read -r -d '' entry; do
+        if [[ -z "$entry" ]]; then
+            candidate_path=""
+            candidate_branch=""
+            continue
+        fi
+
+        case "$entry" in
+            "worktree "*)
+                candidate_path=${entry#worktree }
+                [[ -n "$MAIN_WORKTREE" ]] || MAIN_WORKTREE="$candidate_path"
+                ;;
+            "branch refs/heads/"*)
+                candidate_branch=${entry#branch refs/heads/}
+                if [[ "$candidate_branch" == "$wanted_branch" && -n "$candidate_path" ]]; then
+                    TARGET_WORKTREE="$candidate_path"
+                fi
+                ;;
+        esac
+    done < <(git -C "$REPO_ROOT" worktree list --porcelain -z)
+
+    [[ -n "$MAIN_WORKTREE" && -n "$TARGET_WORKTREE" ]]
+}
+
+package_script() {
+    local script_name="$1"
+    node -e 'const p=require(process.argv[1]); process.stdout.write((p.scripts||{})[process.argv[2]]||"")' \
+        "$PACKAGE_JSON" "$script_name" 2>/dev/null || true
+}
+
+detect_package_manager() {
+    local declared=""
+
+    PACKAGE_MANAGER=$(config_get worktreePreview.packageManager)
+    [[ -z "$PACKAGE_MANAGER" ]] || return 0
+
+    if command -v node >/dev/null 2>&1 && [[ -f "$PACKAGE_JSON" ]]; then
+        declared=$(node -e 'const p=require(process.argv[1]); process.stdout.write((p.packageManager||"").split("@")[0])' \
+            "$PACKAGE_JSON" 2>/dev/null || true)
+    fi
+
+    case "$declared" in
+        pnpm|npm|yarn|bun)
+            PACKAGE_MANAGER="$declared"
+            return 0
+            ;;
+    esac
+
+    if [[ -f "$TARGET_APP/pnpm-lock.yaml" ]]; then
+        PACKAGE_MANAGER="pnpm"
+    elif [[ -f "$TARGET_APP/package-lock.json" || -f "$TARGET_APP/npm-shrinkwrap.json" ]]; then
+        PACKAGE_MANAGER="npm"
+    elif [[ -f "$TARGET_APP/yarn.lock" ]]; then
+        PACKAGE_MANAGER="yarn"
+    elif [[ -f "$TARGET_APP/bun.lock" || -f "$TARGET_APP/bun.lockb" ]]; then
+        PACKAGE_MANAGER="bun"
+    else
+        PACKAGE_MANAGER=""
+    fi
+}
+
+script_command() {
+    local script_name="$1"
+    local args="$2"
+
+    case "$PACKAGE_MANAGER" in
+        pnpm) printf 'pnpm run %s %s\n' "$script_name" "$args" ;;
+        npm) printf 'npm run %s -- %s\n' "$script_name" "$args" ;;
+        yarn) printf 'yarn %s %s\n' "$script_name" "$args" ;;
+        bun) printf 'bun run %s %s\n' "$script_name" "$args" ;;
+        *) return 1 ;;
+    esac
+}
+
+detect_commands() {
+    local start_script=""
+    local dev_script=""
+
+    INSTALL_COMMAND=$(config_get worktreePreview.install)
+    START_COMMAND=$(config_get worktreePreview.start)
+
+    validate_single_line_command "worktreePreview.install" "$INSTALL_COMMAND"
+    validate_single_line_command "worktreePreview.start" "$START_COMMAND"
+
+    if [[ "$INSTALL_COMMAND" == "false" || "$INSTALL_COMMAND" == "none" ]]; then
+        INSTALL_COMMAND=""
+    elif [[ -z "$INSTALL_COMMAND" ]]; then
+        case "$PACKAGE_MANAGER" in
+            pnpm) INSTALL_COMMAND="pnpm install --frozen-lockfile" ;;
+            npm) INSTALL_COMMAND="npm ci" ;;
+            yarn) INSTALL_COMMAND="yarn install --immutable" ;;
+            bun) INSTALL_COMMAND="bun install --frozen-lockfile" ;;
+            *) INSTALL_COMMAND="" ;;
+        esac
+    fi
+
+    [[ -n "$START_COMMAND" ]] && return 0
+    [[ -f "$PACKAGE_JSON" ]] || return 1
+    command -v node >/dev/null 2>&1 || return 1
+
+    start_script=$(package_script start)
+    dev_script=$(package_script dev)
+
+    if [[ "$start_script" == *vite* && "$start_script" != *--open* ]]; then
+        START_COMMAND=$(script_command start "--port \"\$WORKTREE_PREVIEW_PORT\" --strictPort")
+    elif [[ "$dev_script" == *vite* && "$dev_script" != *--open* ]]; then
+        START_COMMAND=$(script_command dev "--port \"\$WORKTREE_PREVIEW_PORT\" --strictPort")
+    elif [[ "$dev_script" == *next* ]]; then
+        START_COMMAND=$(script_command dev "--port \"\$WORKTREE_PREVIEW_PORT\"")
+    elif [[ "$start_script" == *react-scripts* ]]; then
+        START_COMMAND=$(script_command start '')
+    else
+        return 1
+    fi
+}
+
+load_environment_files() {
+    local env_file
+
+    ENV_FILES=()
+    while IFS= read -r env_file; do
+        [[ -n "$env_file" ]] && ENV_FILES+=("$env_file")
+    done < <(git -C "$REPO_ROOT" config --local --get-all worktreePreview.envFile 2>/dev/null || true)
+
+}
+
+ensure_environment_files() {
+    local env_file
+    local source_file
+    local target_file
+    local target_dir
+    local repo_relative_file
+
+    [[ ${#ENV_FILES[@]} -gt 0 ]] || return 0
+    for env_file in "${ENV_FILES[@]}"; do
+        [[ "$env_file" != /* && "$env_file" != *".."* ]] || fail "unsafe env-file path: $env_file"
+        source_file="$MAIN_APP/$env_file"
+        target_file="$TARGET_APP/$env_file"
+        [[ -e "$source_file" || -L "$source_file" ]] || continue
+
+        if [[ -L "$target_file" && ! -e "$target_file" ]]; then
+            fail "dangling environment symlink: $target_file"
+        fi
+
+        [[ -e "$target_file" || -L "$target_file" ]] && continue
+        if [[ "$APP_DIR" == "." ]]; then
+            repo_relative_file="$env_file"
+        else
+            repo_relative_file="$APP_DIR/$env_file"
+        fi
+        git -C "$TARGET_WORKTREE" check-ignore -q -- "$repo_relative_file" ||
+            fail "refusing to link environment file that Git does not ignore: $repo_relative_file"
+        target_dir=$(dirname "$target_file")
+        mkdir -p "$target_dir" || fail "could not create $target_dir"
+        ln -s "$source_file" "$target_file" || fail "could not link $target_file"
+        note "Linked $env_file"
+    done
+}
+
+dependency_hash() {
+    local file
+    local found=0
+    local hashes="install $INSTALL_COMMAND"$'\n'
+
+    for file in package.json pnpm-lock.yaml pnpm-workspace.yaml package-lock.json npm-shrinkwrap.json yarn.lock bun.lock bun.lockb; do
+        if [[ -f "$TARGET_APP/$file" ]]; then
+            found=1
+            hashes="${hashes}$(hash_file "$TARGET_APP/$file") $file"$'\n'
+        fi
+    done
+
+    [[ "$found" -eq 1 ]] || return 1
+    printf '%s' "$hashes" | hash_stdin
+}
+
+dependencies_present() {
+    [[ -d "$TARGET_APP/node_modules" || -f "$TARGET_APP/.pnp.cjs" || -f "$TARGET_APP/.pnp.js" ]]
+}
+
+ensure_dependencies() {
+    local expected_hash
+    local installed_hash=""
+
+    [[ -n "$INSTALL_COMMAND" ]] || return 0
+    mkdir -p "$STATE_DIR" || fail "could not create state directory"
+    expected_hash=$(dependency_hash) || fail "could not hash dependency files"
+    [[ -f "$DEPENDENCY_STAMP" ]] && installed_hash=$(<"$DEPENDENCY_STAMP")
+
+    if ! dependencies_present; then
+        note "Installing dependencies in $TARGET_APP"
+        (cd "$TARGET_APP" && "$SHELL_PATH" -lc "$INSTALL_COMMAND") || fail "dependency install failed"
+        printf '%s\n' "$expected_hash" > "$DEPENDENCY_STAMP"
+        return 0
+    fi
+
+    if [[ -z "$installed_hash" ]]; then
+        printf '%s\n' "$expected_hash" > "$DEPENDENCY_STAMP"
+        note "Using existing dependencies"
+        return 0
+    fi
+
+    if [[ "$installed_hash" != "$expected_hash" ]]; then
+        note "Dependency files changed; refreshing dependencies"
+        (cd "$TARGET_APP" && "$SHELL_PATH" -lc "$INSTALL_COMMAND") || fail "dependency install failed"
+        printf '%s\n' "$expected_hash" > "$DEPENDENCY_STAMP"
+    fi
+}
+
+prepare_target() {
+    local branch="$1"
+    local repo_hash
+    local target_hash
+
+    resolve_worktrees "$branch" || fail "no existing worktree for branch: $branch"
+    MAIN_WORKTREE=$(cd "$MAIN_WORKTREE" && pwd -P) || fail "main worktree is unavailable"
+    TARGET_WORKTREE=$(cd "$TARGET_WORKTREE" && pwd -P) || fail "target worktree is unavailable"
+    TARGET_LABEL=$(basename "$TARGET_WORKTREE")
+
+    MAIN_APP=$(cd "$MAIN_WORKTREE/$APP_DIR" 2>/dev/null && pwd -P) || fail "main app directory missing: $APP_DIR"
+    TARGET_APP=$(cd "$TARGET_WORKTREE/$APP_DIR" 2>/dev/null && pwd -P) || fail "target app directory missing: $APP_DIR"
+    case "$TARGET_APP" in
+        "$TARGET_WORKTREE"|"$TARGET_WORKTREE"/*) ;;
+        *) fail "appDir escapes target worktree" ;;
+    esac
+
+    PACKAGE_JSON="$TARGET_APP/package.json"
+    detect_package_manager
+    detect_commands || fail "could not detect start command; set git config worktreePreview.start"
+    load_environment_files
+
+    repo_hash=$(printf '%s' "$COMMON_DIR" | hash_stdin)
+    repo_hash=${repo_hash:0:12}
+    target_hash=$(printf '%s' "$TARGET_APP" | hash_stdin)
+    target_hash=${target_hash:0:12}
+    DEPENDENCY_STAMP="$STATE_DIR/deps-$repo_hash-$target_hash.sha256"
+}
+
+tmux_option() {
+    tmux show-option -qv -t "$TMUX_SESSION" "$1" 2>/dev/null || true
+}
+
+set_runtime_state() {
+    local pid="$1"
+    local pgid
+    local shell_pgid
+    local shell_pid
+
+    pgid=$(process_group_id "$pid")
+    shell_pid=$(pane_shell_pid "$SERVER_PANE")
+    shell_pgid=$(process_group_id "$shell_pid")
+    [[ "$pgid" =~ ^[0-9]+$ && "$pgid" -gt 0 ]] || fail "could not determine preview process group"
+    [[ "$shell_pid" =~ ^[0-9]+$ && "$shell_pid" -gt 0 ]] || fail "could not determine tmux pane shell PID"
+    [[ "$shell_pgid" =~ ^[0-9]+$ && "$pgid" != "$shell_pgid" ]] ||
+        fail "preview did not start in its own process group"
+
+    tmux set-option -q -t "$TMUX_SESSION" "$STATUS_OPTION" "$PREVIEW_PORT -> $TARGET_LABEL" ||
+        fail "could not update tmux preview status"
+    tmux set-option -q -t "$TMUX_SESSION" "$PANE_OPTION" "$SERVER_PANE" ||
+        fail "could not record tmux preview pane"
+    tmux set-option -q -t "$TMUX_SESSION" "$PID_OPTION" "$pid" ||
+        fail "could not record preview PID"
+    tmux set-option -q -t "$TMUX_SESSION" "$CWD_OPTION" "$TARGET_APP" ||
+        fail "could not record preview directory"
+    tmux set-option -q -t "$TMUX_SESSION" "$PGID_OPTION" "$pgid" ||
+        fail "could not record preview process group"
+    tmux set-option -q -t "$TMUX_SESSION" "$PORT_OPTION" "$PREVIEW_PORT" ||
+        fail "could not record preview port"
+    tmux set-option -q -t "$TMUX_SESSION" "$WINDOW_OPTION" "$SERVER_WINDOW" ||
+        fail "could not record preview window"
+    tmux set-option -q -t "$TMUX_SESSION" "$SHELL_PID_OPTION" "$shell_pid" ||
+        fail "could not record tmux pane shell PID"
+}
+
+clear_runtime_state() {
+    tmux set-option -q -u -t "$TMUX_SESSION" "$STATUS_OPTION" 2>/dev/null || true
+    tmux set-option -q -u -t "$TMUX_SESSION" "$PANE_OPTION" 2>/dev/null || true
+    tmux set-option -q -u -t "$TMUX_SESSION" "$PID_OPTION" 2>/dev/null || true
+    tmux set-option -q -u -t "$TMUX_SESSION" "$CWD_OPTION" 2>/dev/null || true
+    tmux set-option -q -u -t "$TMUX_SESSION" "$PGID_OPTION" 2>/dev/null || true
+    tmux set-option -q -u -t "$TMUX_SESSION" "$PORT_OPTION" 2>/dev/null || true
+    tmux set-option -q -u -t "$TMUX_SESSION" "$WINDOW_OPTION" 2>/dev/null || true
+    tmux set-option -q -u -t "$TMUX_SESSION" "$SHELL_PID_OPTION" 2>/dev/null || true
+}
+
+runtime_state_present() {
+    [[ -n "$(tmux_option "$PGID_OPTION")" || -n "$(tmux_option "$PORT_OPTION")" ||
+        -n "$(tmux_option "$CWD_OPTION")" ]]
+}
+
+refresh_runtime_process() {
+    local pid="$1"
+    local pgid="$2"
+
+    tmux set-option -q -t "$TMUX_SESSION" "$PID_OPTION" "$pid" 2>/dev/null || return 1
+    tmux set-option -q -t "$TMUX_SESSION" "$PGID_OPTION" "$pgid" 2>/dev/null || return 1
+}
+
+owned_listener_pid() {
+    local pid
+    local pane
+    local cwd
+    local pgid
+    local port
+    local shell_pid
+    local actual_cwd
+    local actual_pgid
+    local actual_shell_pid
+    local foreground_pgid
+
+    pane=$(tmux_option "$PANE_OPTION")
+    cwd=$(tmux_option "$CWD_OPTION")
+    pgid=$(tmux_option "$PGID_OPTION")
+    port=$(tmux_option "$PORT_OPTION")
+    shell_pid=$(tmux_option "$SHELL_PID_OPTION")
+    [[ -n "$pane" && -n "$cwd" && "$pgid" =~ ^[0-9]+$ && "$pgid" -gt 0 ]] || return 1
+    [[ "$port" =~ ^[0-9]+$ && "$port" -ge 1 && "$port" -le 65535 ]] || return 1
+
+    while IFS= read -r pid; do
+        [[ -n "$pid" ]] || continue
+        actual_cwd=$(process_cwd "$pid")
+        [[ "$actual_cwd" == "$cwd" ]] || continue
+        actual_pgid=$(process_group_id "$pid")
+        [[ "$actual_pgid" =~ ^[0-9]+$ && "$actual_pgid" -gt 0 ]] || continue
+
+        if [[ "$actual_pgid" == "$pgid" ]]; then
+            refresh_runtime_process "$pid" "$actual_pgid" || return 1
+            printf '%s\n' "$pid"
+            return 0
+        fi
+
+        actual_shell_pid=$(pane_shell_pid "$pane")
+        [[ -n "$shell_pid" && "$actual_shell_pid" == "$shell_pid" ]] || continue
+        foreground_pgid=$(pane_foreground_pgid "$shell_pid")
+        if [[ "$foreground_pgid" == "$actual_pgid" ]]; then
+            refresh_runtime_process "$pid" "$actual_pgid" || return 1
+            printf '%s\n' "$pid"
+            return 0
+        fi
+    done < <(listener_pids "$port" 2>/dev/null || true)
+
+    return 1
+}
+
+pane_command() {
+    tmux display-message -p -t "$SERVER_PANE" '#{pane_current_command}' 2>/dev/null |
+        sed -n '1p'
+}
+
+pane_command_is_shell() {
+    local pane_command
+
+    pane_command=$(pane_command)
+    [[ -n "$pane_command" ]] || return 1
+    pane_command=$(basename "$pane_command")
+    case "$pane_command" in
+        bash|dash|fish|ksh|sh|zsh) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+pane_is_idle() {
+    local pane_command
+
+    pane_command=$(pane_command)
+    [[ -n "$pane_command" ]] || fail "could not inspect tmux pane $SERVER_PANE"
+    pane_command=$(basename "$pane_command")
+    case "$pane_command" in
+        bash|dash|fish|ksh|sh|zsh) return 0 ;;
+        *) fail "tmux pane $SERVER_PANE is busy with $pane_command; use a dedicated '$SERVER_WINDOW' window" ;;
+    esac
+}
+
+wait_for_pane_idle() {
+    local attempts=0
+
+    while (( attempts < 50 )); do
+        pane_command_is_shell && return 0
+        sleep 0.1
+        (( attempts += 1 ))
+    done
+    pane_is_idle
+}
+
+stop_owned_server() {
+    local pid
+    local cwd
+    local pgid
+    local port
+    local window
+    local kill_command="${WORKTREE_PREVIEW_KILL_COMMAND:-/bin/kill}"
+    local attempts=0
+
+    pid=$(owned_listener_pid 2>/dev/null || true)
+    [[ -n "$pid" ]] || return 1
+    pgid=$(tmux_option "$PGID_OPTION")
+    port=$(tmux_option "$PORT_OPTION")
+    window=$(tmux_option "$WINDOW_OPTION")
+    cwd=$(tmux_option "$CWD_OPTION")
+    [[ -x "$kill_command" ]] || fail "kill command is not executable: $kill_command"
+
+    "$kill_command" -INT -- "-$pgid" || fail "could not stop preview process group $pgid"
+    while (( attempts < 50 )); do
+        if [[ -z "$(owned_listener_pid 2>/dev/null || true)" ]]; then
+            clear_runtime_state
+            note "Stopped $TMUX_SESSION:${window:-unknown}"
+            return 0
+        fi
+        sleep 0.1
+        (( attempts += 1 ))
+    done
+
+    fail "owned preview process group $pgid ($cwd) did not release port $port"
+}
+
+stop_server() {
+    command -v lsof >/dev/null 2>&1 || fail "lsof not found"
+    command -v ps >/dev/null 2>&1 || fail "ps not found"
+    if stop_owned_server; then
+        return 0
+    fi
+
+    if runtime_state_present; then
+        clear_runtime_state
+        note "Cleared stale preview state; no owned listener was found"
+        return 0
+    fi
+
+    clear_runtime_state
+    note "No owned preview running in $TMUX_SESSION"
+}
+
+show_status() {
+    local marker=""
+    local pid=""
+    local cwd=""
+    local port=""
+    local window=""
+    local ownership="none"
+
+    command -v lsof >/dev/null 2>&1 || fail "lsof not found"
+    command -v ps >/dev/null 2>&1 || fail "ps not found"
+    marker=$(tmux_option "$STATUS_OPTION")
+    cwd=$(tmux_option "$CWD_OPTION")
+    port=$(tmux_option "$PORT_OPTION")
+    window=$(tmux_option "$WINDOW_OPTION")
+    pid=$(owned_listener_pid 2>/dev/null || true)
+    if [[ -n "$pid" ]]; then
+        ownership="owned"
+    elif runtime_state_present; then
+        pid=$(tmux_option "$PID_OPTION")
+        ownership="stale"
+    fi
+
+    note "preview: ${marker:-none}"
+    note "server window: $TMUX_SESSION:${window:-none}"
+    note "port: ${port:-none}"
+    note "pid: ${pid:-none}"
+    note "cwd: ${cwd:-none}"
+    note "state: $ownership"
+}
+
+activate_target() {
+    local branch="$1"
+    local current_marker=""
+    local expected_marker="$PREVIEW_PORT -> $TARGET_LABEL"
+    local existing_pid=""
+    local existing_cwd=""
+    local owned_pid=""
+    local stored_cwd=""
+    local stored_pane=""
+    local stored_port=""
+    local quoted_app
+    local quoted_branch
+    local quoted_payload
+    local quoted_shell
+    local launch_payload
+    local launch_command
+    local attempts=0
+
+    command -v lsof >/dev/null 2>&1 || fail "lsof not found"
+    command -v ps >/dev/null 2>&1 || fail "ps not found"
+    [[ -z "$PACKAGE_MANAGER" ]] || command -v "$PACKAGE_MANAGER" >/dev/null 2>&1 || fail "$PACKAGE_MANAGER not found"
+
+    owned_pid=$(owned_listener_pid 2>/dev/null || true)
+    stored_cwd=$(tmux_option "$CWD_OPTION")
+    stored_pane=$(tmux_option "$PANE_OPTION")
+    stored_port=$(tmux_option "$PORT_OPTION")
+    existing_pid=$(listener_pid)
+    [[ -z "$existing_pid" ]] || existing_cwd=$(process_cwd "$existing_pid")
+    current_marker=$(tmux_option "$STATUS_OPTION")
+    if [[ -n "$owned_pid" && "$stored_port" == "$PREVIEW_PORT" &&
+        "$stored_cwd" == "$TARGET_APP" && "$stored_pane" == "$SERVER_PANE" &&
+        "$current_marker" == "$expected_marker" ]]; then
+        note "Already serving $TARGET_LABEL"
+        return 0
+    fi
+
+    if [[ -z "$owned_pid" ]]; then
+        runtime_state_present && clear_runtime_state
+        if [[ -n "$existing_pid" ]]; then
+            fail "port $PREVIEW_PORT belongs to unowned PID $existing_pid ($existing_cwd)"
+        fi
+        pane_is_idle
+    elif [[ "$stored_port" != "$PREVIEW_PORT" && -n "$existing_pid" ]]; then
+        fail "port $PREVIEW_PORT belongs to unowned PID $existing_pid ($existing_cwd)"
+    elif [[ "$stored_pane" != "$SERVER_PANE" ]]; then
+        pane_is_idle
+    fi
+
+    ensure_environment_files
+    ensure_dependencies
+
+    if [[ -n "$owned_pid" ]]; then
+        stop_owned_server
+    fi
+    wait_for_pane_idle
+
+    existing_pid=$(listener_pid)
+    [[ -z "$existing_pid" ]] || fail "port $PREVIEW_PORT was claimed before launch by PID $existing_pid ($(process_cwd "$existing_pid"))"
+
+    printf -v quoted_app '%q' "$TARGET_APP"
+    printf -v quoted_branch '%q' "$branch"
+    printf -v quoted_shell '%q' "$SHELL_PATH"
+    launch_payload="cd $quoted_app && export WORKTREE_PREVIEW_PORT=$PREVIEW_PORT PORT=$PREVIEW_PORT WORKTREE_PREVIEW_BRANCH=$quoted_branch BROWSER=none && $START_COMMAND"
+    printf -v quoted_payload '%q' "$launch_payload"
+    launch_command="$quoted_shell -lc $quoted_payload"
+    tmux send-keys -t "$SERVER_PANE" "$launch_command" C-m || fail "could not start server command"
+
+    while (( attempts < 75 )); do
+        existing_pid=$(listener_pid)
+        if [[ -n "$existing_pid" ]]; then
+            existing_cwd=$(process_cwd "$existing_pid")
+            if [[ "$existing_cwd" == "$TARGET_APP" ]]; then
+                set_runtime_state "$existing_pid"
+                note "Serving $TARGET_LABEL"
+                note "server window: $TMUX_SESSION:$SERVER_WINDOW"
+                note "url: http://localhost:$PREVIEW_PORT"
+                return 0
+            fi
+
+            fail "port $PREVIEW_PORT was claimed by PID $existing_pid ($existing_cwd)"
+        fi
+        sleep 0.2
+        (( attempts += 1 ))
+    done
+
+    printf '\nLast server-window lines:\n' >&2
+    tmux capture-pane -p -t "$SERVER_PANE" -S -40 >&2 2>/dev/null || true
+    fail "server did not become ready on port $PREVIEW_PORT"
+}
+
+mode="${1:-}"
+case "$mode" in
+    use)
+        shift
+        branch="${1:-}"
+        [[ -n "$branch" ]] || fail "branch name required"
+        branch=${branch#refs/heads/}
+        initialize_repository
+        prepare_target "$branch"
+        initialize_tmux_session
+        resolve_server_pane
+        activate_target "$branch"
+        ;;
+    stop)
+        initialize_tmux_session
+        stop_server
+        ;;
+    status)
+        initialize_tmux_session
+        show_status
+        ;;
+    --dry-run)
+        shift
+        branch="${1:-}"
+        [[ -n "$branch" ]] || fail "branch name required"
+        branch=${branch#refs/heads/}
+        initialize_repository
+        prepare_target "$branch"
+        note "branch: $branch"
+        note "worktree: $TARGET_WORKTREE"
+        note "app: $TARGET_APP"
+        note "port: $PREVIEW_PORT"
+        note "package manager: ${PACKAGE_MANAGER:-custom}"
+        note "install: ${INSTALL_COMMAND:-none}"
+        note "start: $START_COMMAND"
+        if [[ ${#ENV_FILES[@]} -eq 0 ]]; then
+            note "environment files: none"
+        else
+            note "environment files: ${ENV_FILES[*]}"
+        fi
+        ;;
+    -h|--help|"")
+        usage
+        ;;
+    *)
+        fail "unknown command: $mode"
+        ;;
+esac

@@ -1,0 +1,13 @@
+customCommands:
+  - key: "U"
+    context: "localBranches"
+    description: "Use branch worktree for frontend preview"
+    command: "worktree-preview use {{.SelectedLocalBranch.Name | quote}}"
+    loadingText: "Switching worktree preview"
+    output: "terminal"
+  - key: "X"
+    context: "global"
+    description: "Stop worktree preview"
+    command: "worktree-preview stop"
+    loadingText: "Stopping worktree preview"
+    output: "terminal"

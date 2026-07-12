@@ -1,0 +1,28 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v7
+      - name: Check Bash syntax
+        run: bash -n bin/worktree-preview install.sh tests/worktree-preview.sh
+      - name: Run tests
+        run: bash tests/worktree-preview.sh
+
+  shellcheck:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Run ShellCheck
+        run: shellcheck bin/worktree-preview install.sh tests/worktree-preview.sh
