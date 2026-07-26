@@ -350,7 +350,11 @@ dependency_hash() {
 }
 
 dependencies_present() {
-    [[ -d "$TARGET_APP/node_modules" || -f "$TARGET_APP/.pnp.cjs" || -f "$TARGET_APP/.pnp.js" ]]
+    if [[ "$PACKAGE_MANAGER" == "pnpm" ]]; then
+        [[ -f "$TARGET_APP/node_modules/.modules.yaml" ]]
+    else
+        [[ -d "$TARGET_APP/node_modules" || -f "$TARGET_APP/.pnp.cjs" || -f "$TARGET_APP/.pnp.js" ]]
+    fi
 }
 
 ensure_dependencies() {
@@ -370,8 +374,9 @@ ensure_dependencies() {
     fi
 
     if [[ -z "$installed_hash" ]]; then
+        note "Verifying dependencies in $TARGET_APP"
+        (cd "$TARGET_APP" && "$SHELL_PATH" -lc "$INSTALL_COMMAND") || fail "dependency install failed"
         printf '%s\n' "$expected_hash" > "$DEPENDENCY_STAMP"
-        note "Using existing dependencies"
         return 0
     fi
 
