@@ -1,8 +1,8 @@
 customCommands:
-  - key: "U"
-    context: "localBranches"
-    description: "Use branch worktree for frontend preview"
-    command: "worktree-preview use {{.SelectedLocalBranch.Name | quote}}"
+  - key: "P"
+    context: "worktrees"
+    description: "Preview worktree on configured port"
+    command: "worktree-preview use {{.SelectedWorktree.Branch | quote}}"
     loadingText: "Switching worktree preview"
     output: "terminal"
   - key: "X"
