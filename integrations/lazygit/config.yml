@@ -1,7 +1,7 @@
 customCommands:
   - key: "P"
     context: "worktrees"
-    description: "Preview worktree on configured port"
+    description: "Switch preview to selected worktree"
     command: "worktree-preview use {{.SelectedWorktree.Branch | quote}}"
     loadingText: "Switching worktree preview"
     output: "terminal"
