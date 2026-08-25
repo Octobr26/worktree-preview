@@ -15,14 +15,23 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v7
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+      - name: Check formatting
+        run: test -z "$(gofmt -l .)" || { gofmt -l .; exit 1; }
+      - name: Vet
+        run: go vet ./...
+      - name: Run Go tests
+        run: go test ./...
       - name: Check Bash syntax
-        run: bash -n bin/worktree-preview install.sh tests/worktree-preview.sh
-      - name: Run tests
-        run: bash tests/worktree-preview.sh
+        run: bash -n install.sh tests/install.sh && sh -n scripts/package-release.sh
+      - name: Run installer tests
+        run: bash tests/install.sh
 
   shellcheck:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
       - name: Run ShellCheck
-        run: shellcheck bin/worktree-preview install.sh tests/worktree-preview.sh
+        run: shellcheck install.sh tests/install.sh scripts/package-release.sh

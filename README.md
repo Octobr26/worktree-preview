@@ -4,55 +4,57 @@
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 ![Platform](https://img.shields.io/badge/platform-macOS%20%7C%20Linux-lightgrey.svg)
 
-**Review frontend changes from parallel Git worktrees through one stable localhost URL.**
+**Review frontend changes from Git worktrees through stable localhost URLs.**
 
-When coding agents work on separate branches, reviewing their UI changes can mean switching directories, restarting dev servers, and tracking ports.
-`worktree-preview` keeps that review loop on one target: select a local branch in LazyGit, press `U`, and serve its existing worktree from a dedicated tmux window at `http://localhost:3000` or your configured port.
-
-> One branch selected. One server running. One URL to review.
+`worktree-preview` starts development servers in the background, records which repository owns each port, and switches a configured port between existing worktrees.
+It does not require tmux and it never creates or manages worktrees.
 
 ```text
-agent A -> worktree A --\
-agent B -> worktree B ----> select in LazyGit -> tmux server -> localhost:3000
-agent C -> worktree C --/
+worktree A --\
+worktree B ----> select in LazyGit -> background preview -> localhost:3000
+worktree C --/
+
+another repository ---------------------------> localhost:4173
 ```
 
-`worktree-preview` does not create or manage worktrees.
-It switches one preview server among worktrees that already exist.
-
-## Why
-
-Git worktrees make it possible to work on several branches of the same repository at once.
-That is especially useful when each task or coding agent has its own branch and worktree.
-
-The remaining bottleneck is frontend review.
-Without a shared preview loop, each branch can mean another directory, another server command, and another localhost port to remember.
-
-`worktree-preview` keeps its managed preview on one configurable port and switches it to the selected worktree.
+Use one stable port for a repository whose browser origin must not change, or configure different ports for repositories that should run at the same time.
+`wtp list` shows every preview managed by the tool and the repository, branch, and worktree associated with each port.
 
 ## Highlights
 
-- Select a local branch in LazyGit and press `U` to preview its worktree.
-- Keep the browser on one stable localhost URL while switching branches.
-- Use `worktree-preview` as the descriptive command or `wtp` as the short alias.
-- Detect pnpm, npm, Yarn, or Bun from `package.json` and supported lockfiles.
-- Detect common Vite, Next.js, and Create React App scripts.
-- Install dependencies when missing and refresh them when `package.json` or a supported lockfile changes.
-- Refuse to interrupt a busy tmux pane or an unrelated port listener.
+- Start or switch a preview from LazyGit with `P`.
+- Stop the current repository's preview with `X`.
+- Keep each repository on a stable configured port.
+- Run previews as detached process groups without a terminal multiplexer.
+- List all managed preview ports with `wtp list`.
+- Keep logs under the user's state directory and inspect them with `wtp logs`.
+- Detect pnpm, npm, Yarn, or Bun without invoking Node to parse `package.json`.
+- Support explicit commands, a `worktree-preview` package script, and limited Vite, Next.js, and Create React App adapters.
+- Refuse to replace a port owned by another repository or an unowned listener.
 - Forward environment files only when explicitly configured and ignored by Git.
 
 ## Requirements
 
 - macOS or Linux
-- Bash, Git, tmux, `lsof`, and `ps`
-- A local branch already checked out in a Git worktree
-- An idle tmux window for the preview server
-- Node.js for automatic `package.json` script detection
-- pnpm, npm, Yarn, or Bun for the frontend project
-- `sha256sum`, `shasum`, or OpenSSL
-- LazyGit only if you want the `U` and `X` shortcuts
+- Git
+- An existing local branch checked out in a Git worktree
+- The package manager and runtime required by the target project
+- LazyGit only for the optional `P` and `X` shortcuts
+
+The released CLI is a standalone binary.
+Go is only required when building or installing directly from source.
 
 ## Install
+
+Download the archive for your operating system and architecture from [GitHub Releases](https://github.com/Octobr26/worktree-preview/releases), extract it, and run:
+
+```sh
+./install.sh
+```
+
+Release archives include a prebuilt binary, so the installation does not require Go.
+
+To build from a source checkout instead:
 
 ```sh
 git clone https://github.com/Octobr26/worktree-preview.git
@@ -60,73 +62,28 @@ cd worktree-preview
 ./install.sh
 ```
 
+Source installation requires Go.
+
 The default installation creates:
 
 ```text
 ~/.local/bin/worktree-preview
 ~/.local/bin/wtp -> worktree-preview
-~/.local/share/worktree-preview/
+~/.local/share/worktree-preview/lazygit/config.yml
 ```
 
-Add the following line to `~/.zshrc` or `~/.bashrc` if `~/.local/bin` is not already on your `PATH`:
+Add `~/.local/bin` to your `PATH` when needed:
 
 ```sh
 export PATH="$HOME/.local/bin:$PATH"
 ```
 
-Restart the shell, or source the profile you changed, then verify both commands:
-
-```sh
-command -v worktree-preview
-command -v wtp
-```
-
-Use a custom prefix when needed:
+Use a custom prefix or explicitly replace an earlier installation:
 
 ```sh
 ./install.sh --prefix /your/prefix
+./install.sh --force
 ```
-
-A custom prefix also changes the installed integration paths.
-The installer refuses to replace either command unless you pass `--force`, and it never replaces a real directory.
-
-## Set up tmux
-
-Run the command from inside tmux.
-The invoking session needs an idle window named `server` by default, ideally with one pane:
-
-```sh
-tmux new-window -n server
-```
-
-Set another window name per repository if needed:
-
-```sh
-git config worktreePreview.window preview
-```
-
-### Optional status marker
-
-Source the installed format definition before your `status-right` setting:
-
-```tmux
-source-file ~/.local/share/worktree-preview/tmux/worktree-preview.conf
-```
-
-Add `#{E:@worktree_preview_format}` once inside the existing `status-right` value:
-
-```tmux
-set -g status-right '#{E:@worktree_preview_format} %H:%M '
-```
-
-Reload tmux:
-
-```sh
-tmux source-file ~/.tmux.conf
-```
-
-The marker shows the configured port and worktree directory, for example `3000 -> feature-checkout`.
-Keep it in one `set -g status-right` definition; `set -ga` would append another segment on each reload.
 
 ## Set up LazyGit
 
@@ -136,18 +93,13 @@ Find the active LazyGit configuration directory:
 lazygit --print-config-dir
 ```
 
-Merge [`integrations/lazygit/config.yml`](integrations/lazygit/config.yml) into its `config.yml`.
-The installer also copies the snippet to `~/.local/share/worktree-preview/lazygit/config.yml` with the default prefix.
-
-If your configuration already contains `customCommands:`, add the two list entries beneath the existing key rather than adding a second `customCommands:` block.
+Merge [`integrations/lazygit/config.yml`](integrations/lazygit/config.yml) into that directory's `config.yml`.
+If the file already contains `customCommands:`, add the two entries beneath the existing key.
 
 The integration adds:
 
-- `U` in the local-branches panel to start or switch the preview.
-- `X` to stop the preview owned by `worktree-preview`.
-
-LazyGit intentionally uses the descriptive `worktree-preview` command.
-The CLI works without LazyGit.
+- `P` in the worktrees panel to start or switch the selected worktree's preview.
+- `X` anywhere in LazyGit to stop the preview owned by the current repository on its configured port.
 
 ## Use it
 
@@ -157,81 +109,108 @@ Create a worktree for an existing branch:
 git worktree add ../my-app-feature feature/example
 ```
 
-Or create a new branch and worktree together:
+Then select that worktree in LazyGit and press `P`, or run:
 
 ```sh
-git worktree add -b feature/example ../my-app-feature
+wtp use feature/example
 ```
 
-Then:
-
-1. Open LazyGit inside the tmux session.
-2. Select `feature/example` in the local-branches panel.
-3. Press `U`.
-4. Review the app at `http://localhost:3000`.
-5. Select another worktree branch and press `U` again.
-6. Refresh the same browser tab.
-
-For daily CLI use, the short alias is equivalent to the full command:
+The command waits until the exact configured port is ready and then returns while the server continues in the background.
 
 | Command | Purpose |
 | --- | --- |
-| `wtp use feature/example` | Start or switch to that branch's existing worktree |
-| `wtp status` | Show the recorded preview, port, PID, directory, and ownership state |
-| `wtp stop` | Stop the preview process group owned by the tool |
-| `wtp --dry-run feature/example` | Inspect detection without starting a server |
+| `wtp use feature/example` | Point the configured port at an existing branch worktree, replacing any preview this repository is running |
+| `wtp stop` | Stop the preview owned by the current repository on its configured port |
+| `wtp status` | Show the current repository's preview and ownership state |
+| `wtp list` | Show all managed ports and their repositories, branches, and worktrees |
+| `wtp logs` | Show the latest 80 log lines for the current repository's preview |
+| `wtp dry-run feature/example` | Show the resolved target and commands without changing runtime state |
 
-`worktree-preview use`, `worktree-preview status`, and the other full commands remain available.
+`worktree-preview` and the short `wtp` alias are equivalent.
 
-## Automatic detection
+### Switching worktrees
 
-Package-manager detection uses the `packageManager` field or a supported lockfile.
-The default install commands are:
+A repository previews one worktree at a time on one stable port.
+Running `use` against another worktree of the same repository switches the port over to it:
 
-| Project | Default install |
+```sh
+wtp use feature/other
+```
+
+```
+Stopping feature/example on port 3000
+Serving my-app-other
+url: http://localhost:3000
+```
+
+The browser URL never changes, so a reload shows the other worktree.
+There is no flag to run two worktrees of one repository at the same time.
+
+A preview owned by a *different* repository is never stopped, and neither is an unowned listener on the port.
+Both fail with the owner named.
+
+## Start-command resolution
+
+The repository owns how its application starts.
+`worktree-preview` owns the stable-port contract by exporting `WORKTREE_PREVIEW_PORT` and `PORT`, adding known framework flags, waiting for the exact port, and cleaning up failed launches.
+
+The resolver uses this order:
+
+1. The repository-local `worktreePreview.start` Git configuration.
+2. A `package.json` script named `worktree-preview`.
+3. A limited adapter for a recognized Vite, Next.js, or Create React App script.
+4. A safe failure with instructions to configure an explicit command.
+
+It does not run an arbitrary `start` or `dev` script when the framework cannot be recognized.
+
+An adapter applies only when the framework is really installed.
+The package manager answers that question, not the `package.json` dependency maps.
+This recognizes frameworks that a template or a workspace hoists without declaring them.
+When the package manager cannot answer, the resolver reads the installed `node_modules` tree, then the declared dependencies.
+
+Detection therefore runs after dependency installation.
+A `dry-run` on a worktree with no dependencies reports `start: unresolved`, which is expected.
+
+Example explicit command:
+
+```sh
+git config worktreePreview.start 'pnpm run preview -- --port "$WORKTREE_PREVIEW_PORT"'
+```
+
+The command must remain in the foreground and listen on the configured port.
+The CLI detaches and supervises the command's process group itself.
+
+The package manager itself is detected from the `packageManager` field or a supported lockfile.
+Default dependency commands are:
+
+| Package manager | Default install |
 | --- | --- |
 | pnpm | `pnpm install --frozen-lockfile` |
 | npm | `npm ci` |
 | modern Yarn | `yarn install --immutable` |
 | Bun | `bun install --frozen-lockfile` |
 
-Start-command detection currently covers:
-
-- Vite in a `start` or `dev` script when the script does not contain `--open`
-- Next.js in a `dev` script
-- Create React App in a `start` script
-
-Override either command when the project does not match those defaults:
+Disable automatic dependency installation when the repository manages it another way:
 
 ```sh
-git config worktreePreview.install 'npm install'
-git config worktreePreview.start 'npm run preview -- --port "$WORKTREE_PREVIEW_PORT"'
+git config worktreePreview.install none
 ```
-
-Yarn Classic projects can use:
-
-```sh
-git config worktreePreview.install 'yarn install --frozen-lockfile'
-```
-
-Projects without an npm lockfile should override the default `npm ci` command.
 
 ## Repository configuration
 
-Configuration is stored in the repository's local Git config.
+Configuration is stored in the repository's local Git config and is shared by its worktrees.
 
 | Key | Default | Purpose |
 | --- | --- | --- |
 | `worktreePreview.appDir` | `.` | App directory relative to each worktree |
-| `worktreePreview.port` | `3000` | Preview port |
+| `worktreePreview.port` | `3000` | Stable preview port for this repository |
 | `worktreePreview.packageManager` | detected | `pnpm`, `npm`, `yarn`, or `bun` |
-| `worktreePreview.install` | detected | Dependency install command; use `none` to disable |
-| `worktreePreview.start` | detected | Dev-server command |
+| `worktreePreview.install` | detected | Dependency command; use `none` to disable |
+| `worktreePreview.start` | detected | Explicit foreground dev-server command |
 | `worktreePreview.envFile` | none | Ignored environment file to link from the main worktree; repeatable |
-| `worktreePreview.window` | `server` | Dedicated tmux window name |
-| `worktreePreview.shell` | Bash | Bash-compatible executable used for install and launch commands |
+| `worktreePreview.shell` | `/bin/sh` | Shell used for install and start commands |
 
-Example for a frontend subdirectory:
+Example for a frontend subdirectory on a second port:
 
 ```sh
 git config worktreePreview.appDir frontend
@@ -239,49 +218,53 @@ git config worktreePreview.port 4173
 git config worktreePreview.start 'pnpm run dev -- --port "$WORKTREE_PREVIEW_PORT" --strictPort'
 ```
 
-Disable automatic dependency installation:
-
-```sh
-git config worktreePreview.install none
-```
-
-Environment forwarding is opt-in.
-The file must exist in the main worktree and must be ignored by Git in the target worktree:
+Environment forwarding remains opt-in.
+The source must exist in the main worktree and the destination must be ignored by Git:
 
 ```sh
 git config --add worktreePreview.envFile .env.local
 ```
 
-For monorepos that install dependencies from the workspace root, keep `appDir` at `.` and use a package-targeted start command, or disable automatic installation and manage dependencies separately.
+## Runtime state and safety
 
-## Safety and limits
+State is stored under `${XDG_STATE_HOME:-$HOME/.local/state}/worktree-preview`.
+There is one state record and operation lock per managed port, plus a log file and dependency receipts.
 
-`worktree-preview` runs install and start commands from the selected worktree.
-Only preview branches whose code you trust because package-manager lifecycle scripts and dev servers execute local code.
+Each preview records:
 
-Environment files are never forwarded by default.
-When explicitly configured, they are symlinked only if Git ignores the target path, but code in that worktree can still read their contents.
+- Repository identity through Git's resolved common directory
+- Main repository and target worktree paths
+- Branch and app directory
+- Port
+- Launcher PID and process-group ID
+- Process start fingerprint
+- Command, start time, and log path
 
-Before stopping a preview, the tool verifies the listener's working directory, port, and recorded process group.
-It tracks the tmux pane and window as additional runtime state, never sends `Ctrl-C` into a busy or repurposed pane, and refuses to replace an unrelated listener.
+Before signaling a process group, the CLI verifies the repository identity, PID, process group, and process start fingerprint.
+It refuses to stop another repository's preview, refuses to replace an unowned listener, and fails closed when recorded ownership can no longer be verified.
+
+The tool runs package-manager lifecycle scripts and development servers from selected worktrees.
+Only preview code you trust.
 
 Current boundaries:
 
-- One active preview per tmux session
-- Existing worktrees only
-- Local branches only
+- One managed preview per port
+- One worktree previewed per repository at a time; `use` switches between them
+- Multiple repositories may run simultaneously on different ports
+- Existing local worktrees only
 - macOS and Linux
-- Invocation from inside tmux
-- Node-oriented automatic detection; custom commands can cover other setups
+- Custom start commands must stay in the foreground
 
 ## Development
 
 ```sh
-bash -n bin/worktree-preview install.sh tests/worktree-preview.sh
-bash tests/worktree-preview.sh
+go build ./cmd/worktree-preview
+go vet ./...
+go test ./...
+bash tests/install.sh
 ```
 
-CI runs the suite on macOS and Ubuntu and runs ShellCheck on Ubuntu.
+Release packaging cross-compiles standalone macOS and Linux binaries for AMD64 and ARM64.
 
 ## License
 
